@@ -9,7 +9,7 @@ The goal is to turn a stock RC car into a first-person-view vehicle controlled f
 | Area | What is here now |
 | --- | --- |
 | Chassis | Stock Porsche-style car inspected; rear drive and front steering motors identified. |
-| Control firmware | ESP32-CAM Arduino sketch serves a local web controller over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, and a 700 ms command timeout. |
+| Control firmware | ESP32-CAM Arduino sketch serves a local web controller over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, a 700 ms command timeout, and a browser OTA update page. |
 | Power architecture | Two independent 1S batteries: motor battery feeds the driver motor supply; camera battery feeds a TPS61023 5 V boost module. Negatives share a common ground. |
 | Wiring | Editable DIY Layout Creator (DIYLC) project includes the off-board devices and the converter/capacitor perfboard on one canvas. |
 | Still to validate | Final perfboard assembly, battery runtime, motor current and thermal behavior, ESP32-CAM supply stability, camera streaming, and driving video. |
@@ -33,7 +33,7 @@ The ESP32-CAM's 3.3 V output provides the TB6612FNG's **logic supply and control
 
 ## Control firmware
 
-The current sketch targets an **AI-Thinker ESP32-CAM** using **Arduino-ESP32 3.x**. Open the `.ino` inside the same-named folder in Arduino IDE, select the matching board, flash it through a suitable serial programmer, and disconnect the programmer before testing the car on battery power. The sketch creates a Wi-Fi access point; its SSID and password are constants near the top of the file. Connect a phone or laptop and open the IP address printed to Serial (typically `192.168.4.1`). Hold the on-screen buttons or use **W/A/S/D**; the drive slider adjusts rear motor PWM.
+The current sketch targets an **AI-Thinker ESP32-CAM** using **Arduino-ESP32 3.x**. Set a local OTA password and select an OTA-capable partition scheme before the first serial flash. The sketch creates a Wi-Fi access point; connect a phone or laptop and open the IP address printed to Serial (typically `192.168.4.1`). Hold the on-screen buttons or use **W/A/S/D**; the drive slider adjusts rear motor PWM. Later builds can be uploaded through the authenticated `/update` page while the car is parked. See the [firmware instructions](firmware/esp32_cam_tb6612_motor_test/README.md).
 
 The camera and microSD card are **not initialized**. GPIO12–15 are assigned to motor control, so microSD cannot be used with this pin map. GPIO12 is also an ESP32 boot strapping pin: if a connected driver prevents boot, isolate or revise that connection before considering the build complete. The [firmware notes](firmware/esp32_cam_tb6612_motor_test/README.md) describe the control behavior and known limits.
 

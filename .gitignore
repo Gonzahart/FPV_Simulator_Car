@@ -1,0 +1,7 @@
+# Local firmware credentials
+firmware/esp32_cam_tb6612_motor_test/ota_config.h
+
+# Arduino build output
+*.bin
+*.elf
+*.map
