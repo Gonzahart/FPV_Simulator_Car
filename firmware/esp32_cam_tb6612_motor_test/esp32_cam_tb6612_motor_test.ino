@@ -43,7 +43,8 @@ constexpr bool STEERING_REVERSED = false;
 // Steering gets full power briefly, then reduced holding power to limit the
 // stall current of the usual spring-centered toy steering mechanism.
 constexpr int STEER_KICK_PWM = 255;
-constexpr int STEER_HOLD_PWM = 150;
+constexpr int DEFAULT_STEER_HOLD_PWM = 210;
+constexpr int MIN_STEER_HOLD_PWM = 150;
 constexpr uint32_t STEER_KICK_MS = 120;
 
 // If control packets stop arriving, shut both motors off.
@@ -51,6 +52,7 @@ constexpr uint32_t COMMAND_TIMEOUT_MS = 700;
 
 int requestedDrive = 0;  // -255 to +255
 int requestedSteer = 0;  // -1, 0, or +1
+int steeringHoldPwm = DEFAULT_STEER_HOLD_PWM;
 int previousSteer = 0;
 uint32_t steerStartedAt = 0;
 uint32_t lastCommandAt = 0;
@@ -96,6 +98,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     <label>Drive power: <span id="speedValue">180</span>/255</label>
     <input id="speed" type="range" min="80" max="255" value="180">
   </div>
+  <div class="speed">
+    <label>Steering hold power: <span id="holdValue">210</span>/255</label>
+    <input id="hold" type="range" min="150" max="255" step="5" value="210">
+    <small>Use the lowest setting that keeps the wheels turned.</small>
+  </div>
   <div class="controls">
     <div class="group">
       <button data-axis="steer" data-value="-1">LEFT</button>
@@ -113,10 +120,13 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   let driveDirection = 0;
   let steerDirection = 0;
   let drivePower = 180;
+  let steerHoldPower = 210;
   let requestPending = false;
 
   const speed = document.getElementById('speed');
   const speedValue = document.getElementById('speedValue');
+  const hold = document.getElementById('hold');
+  const holdValue = document.getElementById('holdValue');
   const status = document.getElementById('status');
   const camera = document.getElementById('camera');
   const cameraStatus = document.getElementById('cameraStatus');
@@ -132,11 +142,18 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     speedValue.textContent = drivePower;
   });
 
+  hold.addEventListener('input', () => {
+    steerHoldPower = Number(hold.value);
+    holdValue.textContent = steerHoldPower;
+    sendState();
+  });
+
   function sendState(force = false) {
     if (requestPending && !force) return;
     requestPending = true;
     const drive = driveDirection * drivePower;
-    fetch(`/control?drive=${drive}&steer=${steerDirection}`, { cache: 'no-store' })
+    fetch(`/control?drive=${drive}&steer=${steerDirection}&hold=${steerHoldPower}`,
+          { cache: 'no-store' })
       .then(r => {
         if (!r.ok) throw new Error('request failed');
         status.textContent = `Drive ${drive}, steer ${steerDirection}`;
@@ -341,7 +358,7 @@ void applyMotorCommands() {
   }
 
   const int steeringPower =
-      (millis() - steerStartedAt < STEER_KICK_MS) ? STEER_KICK_PWM : STEER_HOLD_PWM;
+      (millis() - steerStartedAt < STEER_KICK_MS) ? STEER_KICK_PWM : steeringHoldPwm;
   writeBridge(STEER_IN1, STEER_IN2, requestedSteer * steeringPower, STEERING_REVERSED);
 }
 
@@ -358,6 +375,10 @@ void handleControl() {
 
   requestedDrive = constrain(server.arg("drive").toInt(), -MAX_PWM, MAX_PWM);
   requestedSteer = constrain(server.arg("steer").toInt(), -1, 1);
+  if (server.hasArg("hold")) {
+    steeringHoldPwm = constrain(server.arg("hold").toInt(),
+                                MIN_STEER_HOLD_PWM, MAX_PWM);
+  }
   lastCommandAt = millis();
   applyMotorCommands();
   server.send(200, "text/plain", "OK");
