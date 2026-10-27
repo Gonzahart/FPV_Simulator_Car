@@ -2,9 +2,13 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include "esp_camera.h"
+// WebServer and ESP-IDF both define HTTP_ANY; neither handler uses it here.
+#undef HTTP_ANY
+#include "esp_http_server.h"
 #include "ota_config.h"
 
-// Motor-only validation sketch for an AI-Thinker ESP32-CAM.
+// Motor control, OTA updates, and MJPEG video for an AI-Thinker ESP32-CAM.
 // Requires Arduino-ESP32 board package 3.x.
 // Do not initialize or use the microSD card with this pin assignment.
 
@@ -12,6 +16,8 @@ const char *AP_SSID = "DriftCar1.0";
 const char *AP_PASSWORD = "drift1234";  // Must be at least 8 characters.
 
 WebServer server(80);
+httpd_handle_t streamServer = nullptr;
+bool cameraReady = false;
 
 // TB6612FNG connections. PWMA, PWMB, and STBY are tied to ESP32-CAM 3.3 V.
 // Channel A: rear drive motor. Channel B: front steering motor.
@@ -20,8 +26,7 @@ constexpr uint8_t DRIVE_IN2 = 13;  // AIN2
 constexpr uint8_t STEER_IN1 = 14;  // BIN1
 constexpr uint8_t STEER_IN2 = 15;  // BIN2
 
-// ESP32 camera XCLK normally uses LEDC channel 0. Reserve it now so this motor
-// assignment can be retained when camera streaming is added later.
+// Camera XCLK uses LEDC channel 0 / timer 0; keep motors on channels 4-7.
 constexpr uint8_t DRIVE_CH1 = 4;
 constexpr uint8_t DRIVE_CH2 = 5;
 constexpr uint8_t STEER_CH1 = 6;
@@ -49,12 +54,12 @@ int requestedSteer = 0;  // -1, 0, or +1
 int previousSteer = 0;
 uint32_t steerStartedAt = 0;
 uint32_t lastCommandAt = 0;
-bool otaInProgress = false;
+volatile bool otaInProgress = false;
 bool otaStarted = false;
 bool otaFailed = false;
 bool otaComplete = false;
 bool otaForbidden = false;
-bool rebootPending = false;
+volatile bool rebootPending = false;
 const char *OTA_REQUEST_HEADERS[] = {"Origin", "Host"};
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -67,8 +72,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; background: #111; color: #eee; text-align: center; touch-action: none; }
-    main { max-width: 520px; margin: auto; padding: 22px; }
+    main { max-width: 640px; margin: auto; padding: 22px; }
     h1 { font-size: 1.45rem; margin: 0 0 18px; }
+    .video { width: 100%; aspect-ratio: 4 / 3; object-fit: contain;
+             background: #000; border-radius: 12px; }
+    #cameraStatus { color: #9ad; min-height: 1.4em; margin: 8px 0 18px; }
     .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
     .group { display: grid; gap: 12px; align-content: center; }
     button { min-height: 92px; border: 0; border-radius: 18px; font-size: 1.2rem;
@@ -81,7 +89,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </head>
 <body>
 <main>
-  <h1>ESP32 Drift Car — Motor Test</h1>
+  <h1>ESP32 Drift Car</h1>
+  <img id="camera" class="video" alt="Live view from the car camera">
+  <p id="cameraStatus">Connecting to camera…</p>
   <div class="speed">
     <label>Drive power: <span id="speedValue">180</span>/255</label>
     <input id="speed" type="range" min="80" max="255" value="180">
@@ -108,6 +118,14 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   const speed = document.getElementById('speed');
   const speedValue = document.getElementById('speedValue');
   const status = document.getElementById('status');
+  const camera = document.getElementById('camera');
+  const cameraStatus = document.getElementById('cameraStatus');
+
+  // Video uses a separate HTTP server so its long-lived connection cannot
+  // block motor-control requests or the OTA upload page on port 80.
+  camera.onload = () => cameraStatus.textContent = 'Live camera';
+  camera.onerror = () => cameraStatus.textContent = 'Camera unavailable — check Serial output';
+  camera.src = `${location.protocol}//${location.hostname}:81/stream`;
 
   speed.addEventListener('input', () => {
     drivePower = Number(speed.value);
@@ -182,6 +200,106 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 </body>
 </html>
 )HTML";
+
+bool initCamera() {
+  // AI-Thinker ESP32-CAM pin map. GPIO12-15 remain dedicated to the motor driver.
+  camera_config_t config = {};
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = 5;
+  config.pin_d1 = 18;
+  config.pin_d2 = 19;
+  config.pin_d3 = 21;
+  config.pin_d4 = 36;
+  config.pin_d5 = 39;
+  config.pin_d6 = 34;
+  config.pin_d7 = 35;
+  config.pin_xclk = 0;
+  config.pin_pclk = 22;
+  config.pin_vsync = 25;
+  config.pin_href = 23;
+  config.pin_sccb_sda = 26;
+  config.pin_sccb_scl = 27;
+  config.pin_pwdn = 32;
+  config.pin_reset = -1;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+  config.frame_size = FRAMESIZE_QVGA;  // 320x240 limits Wi-Fi and memory load.
+  config.jpeg_quality = 14;
+  const bool hasPsram = psramFound();
+  config.fb_count = hasPsram ? 2 : 1;
+  config.fb_location = hasPsram ? CAMERA_FB_IN_PSRAM : CAMERA_FB_IN_DRAM;
+  config.grab_mode = config.fb_count > 1 ? CAMERA_GRAB_LATEST : CAMERA_GRAB_WHEN_EMPTY;
+
+  const esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("ERROR: Camera init failed (0x%x). Controls and OTA remain available.\n", err);
+    return false;
+  }
+  return true;
+}
+
+esp_err_t handleStream(httpd_req_t *req) {
+  if (!cameraReady || otaInProgress || rebootPending) {
+    return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR,
+                               "Camera unavailable");
+  }
+
+  static const char *CONTENT_TYPE = "multipart/x-mixed-replace;boundary=frame";
+  static const char *BOUNDARY = "\r\n--frame\r\n";
+  if (httpd_resp_set_type(req, CONTENT_TYPE) != ESP_OK) return ESP_FAIL;
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+  esp_err_t result = ESP_OK;
+  while (!otaInProgress && !rebootPending) {
+    camera_fb_t *frame = esp_camera_fb_get();
+    if (!frame) {
+      Serial.println("ERROR: Camera capture failed.");
+      result = ESP_FAIL;
+      break;
+    }
+
+    char header[64];
+    const int length = snprintf(header, sizeof(header),
+                                "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<unsigned>(frame->len));
+    if (length < 0 || length >= static_cast<int>(sizeof(header))) {
+      result = ESP_FAIL;
+    } else {
+      result = httpd_resp_send_chunk(req, BOUNDARY, strlen(BOUNDARY));
+      if (result == ESP_OK) result = httpd_resp_send_chunk(req, header, length);
+      if (result == ESP_OK) {
+        result = httpd_resp_send_chunk(req,
+                                       reinterpret_cast<const char *>(frame->buf),
+                                       frame->len);
+      }
+    }
+    esp_camera_fb_return(frame);
+    if (result != ESP_OK) break;  // Browser disconnected or send failed.
+    delay(1);  // Give control and Wi-Fi tasks time between frames.
+  }
+
+  if (result == ESP_OK) httpd_resp_send_chunk(req, nullptr, 0);
+  return result;
+}
+
+bool startStreamServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 81;
+  config.stack_size = 8192;
+  if (httpd_start(&streamServer, &config) != ESP_OK) return false;
+
+  httpd_uri_t streamUri = {};
+  streamUri.uri = "/stream";
+  streamUri.method = HTTP_GET;
+  streamUri.handler = handleStream;
+  if (httpd_register_uri_handler(streamServer, &streamUri) != ESP_OK) {
+    httpd_stop(streamServer);
+    streamServer = nullptr;
+    return false;
+  }
+  return true;
+}
 
 void writeBridge(uint8_t in1, uint8_t in2, int command, bool reversed) {
   command = constrain(command, -MAX_PWM, MAX_PWM);
@@ -354,6 +472,8 @@ void setup() {
     Serial.println("ERROR: Could not attach one or more motor PWM pins.");
   }
 
+  const bool cameraInitialized = initCamera();
+
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
     Serial.println("ERROR: Could not start Wi-Fi access point.");
@@ -371,6 +491,14 @@ void setup() {
   });
   server.begin();
 
+  if (cameraInitialized) {
+    cameraReady = startStreamServer();
+    if (!cameraReady) {
+      Serial.println("ERROR: Could not start camera stream server on port 81.");
+      esp_camera_deinit();
+    }
+  }
+
   lastCommandAt = millis();
   Serial.println();
   Serial.print("Connect to Wi-Fi: ");
@@ -380,6 +508,11 @@ void setup() {
   Serial.print("Firmware update: http://");
   Serial.print(WiFi.softAPIP());
   Serial.println("/update");
+  if (cameraReady) {
+    Serial.print("Camera stream: http://");
+    Serial.print(WiFi.softAPIP());
+    Serial.println(":81/stream");
+  }
 }
 
 void loop() {
