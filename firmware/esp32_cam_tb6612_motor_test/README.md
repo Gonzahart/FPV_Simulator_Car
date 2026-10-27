@@ -19,6 +19,8 @@
 
 The upload page uses HTTP Basic authentication and checks that a browser POST originated from the car's own page. It runs on the local access point, **not HTTPS**. Do not reuse an important password or expose the access point to untrusted users. The update handler will refuse to start if the selected partition scheme has no spare OTA app slot.
 
+If the update page reports **no OTA application slot**, choosing an OTA scheme for a new compilation alone is insufficient: serial-flash the board again so the partition table itself is replaced. A compiled sketch `.bin` does not contain the partition table. The upload page reports specific `Update` errors for other failures; keep the serial monitor available if further diagnosis is needed.
+
 ## Behavior and limits
 
 | Feature | Implementation |

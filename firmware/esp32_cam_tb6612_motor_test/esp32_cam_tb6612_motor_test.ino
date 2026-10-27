@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
+#include <esp_ota_ops.h>
 #include "ota_config.h"
 
 // Motor-only validation sketch for an AI-Thinker ESP32-CAM.
@@ -54,7 +55,9 @@ bool otaStarted = false;
 bool otaFailed = false;
 bool otaComplete = false;
 bool otaForbidden = false;
+bool otaAuthenticated = false;
 bool rebootPending = false;
+String otaError;
 const char *OTA_REQUEST_HEADERS[] = {"Origin", "Host"};
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -256,6 +259,12 @@ bool otaAuthorized() {
 
 void handleUpdatePage() {
   if (!otaAuthorized()) return;
+  const esp_partition_t *nextSlot = esp_ota_get_next_update_partition(nullptr);
+  if (!nextSlot) {
+    server.send(503, "text/plain",
+        "No OTA application slot is available. Serial-flash with a partition scheme that supports OTA.");
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "text/html",
       "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -272,14 +281,19 @@ void handleUpdatePage() {
 
 void handleUpdateUpload() {
   // WebServer invokes this callback while parsing the multipart POST body.
-  if (!server.authenticate(OTA_USER, OTA_PASSWORD)) return;
-
   HTTPUpload &upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaAuthenticated = server.authenticate(OTA_USER, OTA_PASSWORD);
+  }
+  if (!otaAuthenticated) return;
+
   switch (upload.status) {
     case UPLOAD_FILE_START:
+      otaError = "";
       otaForbidden = server.header("Origin") != String("http://") + server.header("Host");
       if (otaForbidden) {
         otaFailed = true;
+        otaError = "Request origin does not match the car's update page";
         Serial.println("OTA rejected: request origin does not match the car's update page.");
         return;
       }
@@ -291,6 +305,7 @@ void handleUpdateUpload() {
       otaStarted = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
       if (!otaStarted) {
         otaFailed = true;
+        otaError = Update.errorString();
         Update.printError(Serial);
       }
       break;
@@ -299,6 +314,7 @@ void handleUpdateUpload() {
       if (otaStarted && !otaFailed &&
           Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
         otaFailed = true;
+        otaError = Update.errorString();
         Update.printError(Serial);
         Update.abort();
       }
@@ -309,6 +325,7 @@ void handleUpdateUpload() {
         otaComplete = Update.end(true);
         if (!otaComplete) {
           otaFailed = true;
+          otaError = Update.errorString();
           Update.printError(Serial);
         }
       }
@@ -326,16 +343,21 @@ void handleUpdateComplete() {
   if (!otaAuthorized()) return;
   if (otaForbidden) {
     server.send(403, "text/plain", "Update rejected: origin mismatch.");
+    otaAuthenticated = false;
     return;
   }
   if (!otaComplete || otaFailed || Update.hasError()) {
-    server.send(500, "text/plain", "Update failed. Check Serial output and the OTA partition scheme.");
+    String reason = otaError.length() ? otaError : String(Update.errorString());
+    if (!reason.length()) reason = "No complete firmware image was received";
+    server.send(500, "text/plain", "Update failed: " + reason);
     otaInProgress = false;
+    otaAuthenticated = false;
     return;
   }
 
   stopAllMotors();
   server.send(200, "text/plain", "Update complete. Rebooting now.");
+  otaAuthenticated = false;
   rebootPending = true;
 }
 
