@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
+#include "ota_config.h"
 
 // Motor-only validation sketch for an AI-Thinker ESP32-CAM.
 // Requires Arduino-ESP32 board package 3.x.
@@ -47,6 +49,13 @@ int requestedSteer = 0;  // -1, 0, or +1
 int previousSteer = 0;
 uint32_t steerStartedAt = 0;
 uint32_t lastCommandAt = 0;
+bool otaInProgress = false;
+bool otaStarted = false;
+bool otaFailed = false;
+bool otaComplete = false;
+bool otaForbidden = false;
+bool rebootPending = false;
+const char *OTA_REQUEST_HEADERS[] = {"Origin", "Host"};
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -88,6 +97,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     </div>
   </div>
   <p id="status">Connect to the car, then hold a button.</p>
+  <p><a href="/update" style="color:#9ad">Firmware update</a></p>
 </main>
 <script>
   let driveDirection = 0;
@@ -218,6 +228,11 @@ void applyMotorCommands() {
 }
 
 void handleControl() {
+  if (otaInProgress || rebootPending) {
+    server.send(503, "text/plain", "Firmware update in progress; motors are stopped");
+    return;
+  }
+
   if (!server.hasArg("drive") || !server.hasArg("steer")) {
     server.send(400, "text/plain", "Missing drive or steer value");
     return;
@@ -228,6 +243,100 @@ void handleControl() {
   lastCommandAt = millis();
   applyMotorCommands();
   server.send(200, "text/plain", "OK");
+}
+
+// The update page is reachable through the car's existing Wi-Fi access point.
+// Authentication is checked in BOTH the page handler and the upload callback:
+// an unauthenticated POST must never reach Update.begin() or Update.write().
+bool otaAuthorized() {
+  if (server.authenticate(OTA_USER, OTA_PASSWORD)) return true;
+  server.requestAuthentication();
+  return false;
+}
+
+void handleUpdatePage() {
+  if (!otaAuthorized()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/html",
+      "<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>Car firmware update</title></head><body style='font-family:system-ui;max-width:38rem;"
+      "margin:2rem auto;padding:0 1rem'>"
+      "<h1>Car firmware update</h1><p>Park the car, turn off the motor battery, and keep the "
+      "camera battery charged. Motor outputs are disabled when the upload begins.</p>"
+      "<form method='POST' action='/update' enctype='multipart/form-data'>"
+      "<input type='file' name='firmware' accept='.bin' required>"
+      "<button type='submit'>Upload firmware</button></form>"
+      "<p>Upload the compiled sketch .bin built for this board and its OTA partition scheme.</p>"
+      "<p><a href='/'>Back to controls</a></p></body></html>");
+}
+
+void handleUpdateUpload() {
+  // WebServer invokes this callback while parsing the multipart POST body.
+  if (!server.authenticate(OTA_USER, OTA_PASSWORD)) return;
+
+  HTTPUpload &upload = server.upload();
+  switch (upload.status) {
+    case UPLOAD_FILE_START:
+      otaForbidden = server.header("Origin") != String("http://") + server.header("Host");
+      if (otaForbidden) {
+        otaFailed = true;
+        Serial.println("OTA rejected: request origin does not match the car's update page.");
+        return;
+      }
+      otaInProgress = true;
+      otaStarted = false;
+      otaFailed = false;
+      otaComplete = false;
+      stopAllMotors();
+      otaStarted = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+      if (!otaStarted) {
+        otaFailed = true;
+        Update.printError(Serial);
+      }
+      break;
+
+    case UPLOAD_FILE_WRITE:
+      if (otaStarted && !otaFailed &&
+          Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        otaFailed = true;
+        Update.printError(Serial);
+        Update.abort();
+      }
+      break;
+
+    case UPLOAD_FILE_END:
+      if (otaStarted && !otaFailed) {
+        otaComplete = Update.end(true);
+        if (!otaComplete) {
+          otaFailed = true;
+          Update.printError(Serial);
+        }
+      }
+      break;
+
+    case UPLOAD_FILE_ABORTED:
+      if (otaStarted) Update.abort();
+      otaFailed = true;
+      otaInProgress = false;
+      break;
+  }
+}
+
+void handleUpdateComplete() {
+  if (!otaAuthorized()) return;
+  if (otaForbidden) {
+    server.send(403, "text/plain", "Update rejected: origin mismatch.");
+    return;
+  }
+  if (!otaComplete || otaFailed || Update.hasError()) {
+    server.send(500, "text/plain", "Update failed. Check Serial output and the OTA partition scheme.");
+    otaInProgress = false;
+    return;
+  }
+
+  stopAllMotors();
+  server.send(200, "text/plain", "Update complete. Rebooting now.");
+  rebootPending = true;
 }
 
 void setup() {
@@ -250,10 +359,13 @@ void setup() {
     Serial.println("ERROR: Could not start Wi-Fi access point.");
   }
 
+  server.collectHeaders(OTA_REQUEST_HEADERS, 2);
   server.on("/", HTTP_GET, []() {
     server.send_P(200, "text/html", INDEX_HTML);
   });
   server.on("/control", HTTP_GET, handleControl);
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on("/update", HTTP_POST, handleUpdateComplete, handleUpdateUpload);
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found");
   });
@@ -265,10 +377,23 @@ void setup() {
   Serial.println(AP_SSID);
   Serial.print("Open: http://");
   Serial.println(WiFi.softAPIP());
+  Serial.print("Firmware update: http://");
+  Serial.print(WiFi.softAPIP());
+  Serial.println("/update");
 }
 
 void loop() {
   server.handleClient();
+
+  if (otaInProgress || rebootPending) {
+    stopAllMotors();
+    if (rebootPending) {
+      delay(200);  // Let the HTTP response leave before restarting.
+      ESP.restart();
+    }
+    delay(2);
+    return;
+  }
 
   if (millis() - lastCommandAt > COMMAND_TIMEOUT_MS) {
     stopAllMotors();
