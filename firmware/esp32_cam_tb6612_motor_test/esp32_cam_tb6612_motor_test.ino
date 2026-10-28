@@ -26,6 +26,12 @@ constexpr uint8_t DRIVE_IN2 = 13;  // AIN2
 constexpr uint8_t STEER_IN1 = 14;  // BIN1
 constexpr uint8_t STEER_IN2 = 15;  // BIN2
 
+// Logic outputs for external LED switches, not power outputs for the LEDs.
+// GPIO4 also drives the ESP32-CAM's onboard flash LED; GPIO2 is a boot strap
+// pin and its external switch gate must be held low at reset.
+constexpr uint8_t FRONT_LIGHT_PIN = 4;
+constexpr uint8_t REAR_LIGHT_PIN = 2;
+
 // Camera XCLK uses LEDC channel 0 / timer 0; keep motors on channels 4-7.
 constexpr uint8_t DRIVE_CH1 = 4;
 constexpr uint8_t DRIVE_CH2 = 5;
@@ -53,6 +59,8 @@ constexpr uint32_t COMMAND_TIMEOUT_MS = 700;
 int requestedDrive = 0;  // -255 to +255
 int requestedSteer = 0;  // -1, 0, or +1
 int steeringHoldPwm = DEFAULT_STEER_HOLD_PWM;
+bool frontLightsOn = false;
+bool rearLightsOn = false;
 int previousSteer = 0;
 uint32_t steerStartedAt = 0;
 uint32_t lastCommandAt = 0;
@@ -80,6 +88,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
              background: #000; border-radius: 12px; }
     #cameraStatus { color: #9ad; min-height: 1.4em; margin: 8px 0 18px; }
     .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .lights { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 20px 0; }
+    .lights button { min-height: 56px; font-size: 1rem; }
     .group { display: grid; gap: 12px; align-content: center; }
     button { min-height: 92px; border: 0; border-radius: 18px; font-size: 1.2rem;
              font-weight: 700; background: #333; color: white; }
@@ -113,6 +123,11 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button data-axis="drive" data-value="-1">REVERSE</button>
     </div>
   </div>
+  <div class="lights">
+    <button id="frontLights" type="button" aria-pressed="false">Front lights: Off</button>
+    <button id="rearLights" type="button" aria-pressed="false">Rear lights: Off</button>
+  </div>
+  <p id="lightStatus"></p>
   <p id="status">Connect to the car, then hold a button.</p>
   <p><a href="/update" style="color:#9ad">Firmware update</a></p>
 </main>
@@ -130,6 +145,44 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   const status = document.getElementById('status');
   const camera = document.getElementById('camera');
   const cameraStatus = document.getElementById('cameraStatus');
+  const frontLights = document.getElementById('frontLights');
+  const rearLights = document.getElementById('rearLights');
+  const lightStatus = document.getElementById('lightStatus');
+  let lights = { front: false, rear: false };
+  let lightsBusy = false;
+
+  function renderLights() {
+    frontLights.textContent = `Front lights: ${lights.front ? 'On' : 'Off'}`;
+    rearLights.textContent = `Rear lights: ${lights.rear ? 'On' : 'Off'}`;
+    frontLights.setAttribute('aria-pressed', String(lights.front));
+    rearLights.setAttribute('aria-pressed', String(lights.rear));
+  }
+
+  async function setLights(front, rear) {
+    if (lightsBusy) return;
+    lightsBusy = true;
+    frontLights.disabled = rearLights.disabled = true;
+    try {
+      const response = await fetch(`/lights?front=${Number(front)}&rear=${Number(rear)}`,
+                                   { cache: 'no-store' });
+      if (!response.ok) throw new Error('Light command failed');
+      lights = await response.json();
+      renderLights();
+      lightStatus.textContent = '';
+    } catch (_) {
+      lightStatus.textContent = 'Could not change lights. Check the connection.';
+    } finally {
+      lightsBusy = false;
+      frontLights.disabled = rearLights.disabled = false;
+    }
+  }
+
+  frontLights.addEventListener('click', () => setLights(!lights.front, lights.rear));
+  rearLights.addEventListener('click', () => setLights(lights.front, !lights.rear));
+  fetch('/lights', { cache: 'no-store' })
+    .then(response => { if (!response.ok) throw new Error('Light status failed'); return response.json(); })
+    .then(state => { lights = state; renderLights(); })
+    .catch(() => lightStatus.textContent = 'Could not read light status.');
 
   // Video uses a separate HTTP server so its long-lived connection cannot
   // block motor-control requests or the OTA upload page on port 80.
@@ -343,6 +396,13 @@ void stopAllMotors() {
   writeBridge(STEER_IN1, STEER_IN2, 0, STEERING_REVERSED);
 }
 
+void setLights(bool front, bool rear) {
+  frontLightsOn = front;
+  rearLightsOn = rear;
+  digitalWrite(FRONT_LIGHT_PIN, front ? HIGH : LOW);
+  digitalWrite(REAR_LIGHT_PIN, rear ? HIGH : LOW);
+}
+
 void applyMotorCommands() {
   writeBridge(DRIVE_IN1, DRIVE_IN2, requestedDrive, DRIVE_REVERSED);
 
@@ -382,6 +442,34 @@ void handleControl() {
   lastCommandAt = millis();
   applyMotorCommands();
   server.send(200, "text/plain", "OK");
+}
+
+void handleLights() {
+  const bool hasFront = server.hasArg("front");
+  const bool hasRear = server.hasArg("rear");
+  if (hasFront != hasRear) {
+    server.send(400, "text/plain", "Specify both front and rear light states");
+    return;
+  }
+
+  if (hasFront) {
+    if (otaInProgress || rebootPending) {
+      server.send(503, "text/plain", "Firmware update in progress; lights are off");
+      return;
+    }
+    const String front = server.arg("front");
+    const String rear = server.arg("rear");
+    if ((front != "0" && front != "1") || (rear != "0" && rear != "1")) {
+      server.send(400, "text/plain", "Light states must be 0 or 1");
+      return;
+    }
+    setLights(front == "1", rear == "1");
+  }
+
+  server.sendHeader("Cache-Control", "no-store");
+  const String state = String("{\"front\":") + (frontLightsOn ? "true" : "false") +
+                       ",\"rear\":" + (rearLightsOn ? "true" : "false") + "}";
+  server.send(200, "application/json", state);
 }
 
 // The update page is reachable through the car's existing Wi-Fi access point.
@@ -427,6 +515,7 @@ void handleUpdateUpload() {
       otaFailed = false;
       otaComplete = false;
       stopAllMotors();
+      setLights(false, false);
       otaStarted = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
       if (!otaStarted) {
         otaFailed = true;
@@ -482,6 +571,13 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
+  // Both external LED switches default off. External gate pull-downs keep
+  // them off before firmware reaches setup(), including during boot/flash.
+  digitalWrite(FRONT_LIGHT_PIN, LOW);
+  digitalWrite(REAR_LIGHT_PIN, LOW);
+  pinMode(FRONT_LIGHT_PIN, OUTPUT);
+  pinMode(REAR_LIGHT_PIN, OUTPUT);
+
   bool pwmOk = true;
   pwmOk &= ledcAttachChannel(DRIVE_IN1, MOTOR_PWM_HZ, MOTOR_PWM_BITS, DRIVE_CH1);
   pwmOk &= ledcAttachChannel(DRIVE_IN2, MOTOR_PWM_HZ, MOTOR_PWM_BITS, DRIVE_CH2);
@@ -505,6 +601,7 @@ void setup() {
     server.send_P(200, "text/html", INDEX_HTML);
   });
   server.on("/control", HTTP_GET, handleControl);
+  server.on("/lights", HTTP_GET, handleLights);
   server.on("/update", HTTP_GET, handleUpdatePage);
   server.on("/update", HTTP_POST, handleUpdateComplete, handleUpdateUpload);
   server.onNotFound([]() {

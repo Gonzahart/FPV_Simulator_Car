@@ -27,6 +27,14 @@ SW1A and SW1B can be separate switches or two poles of one mechanically linked D
 
 The current firmware applies PWM to the IN pins while PWMA/PWMB remain high. If direction is reversed relative to the controls, change the `DRIVE_REVERSED` or `STEERING_REVERSED` constant or swap the corresponding motor leads after power-off. GPIO12–15 conflict with microSD on the ESP32-CAM. GPIO12's boot strapping behavior also requires a real boot test with the driver attached.
 
+## Body lights: proposed control wiring
+
+The two white front LEDs share one 2-pin JST connector; the two red rear LEDs share a second. Both pairs were powered through the stock receiver board, which is planned for removal. The replacement firmware reserves **GPIO4 for front lights** and **GPIO2 for rear lights**, with separate browser switches. These pins only command external switches; they cannot safely supply the LED pairs directly.
+
+For each pair, use a logic-level N-channel MOSFET as a low-side switch: GPIO → approximately 220 Ω gate resistor → gate; 10 kΩ from gate to common ground; source to common ground; drain to the LED pair's negative lead. Feed the positive lead from a switched supply **through verified current limiting appropriate to the actual LED wiring and supply voltage**. If the two LEDs in a pair are parallel, each LED needs its own current-limited branch. Do not assume the 2-pin harness includes resistors: the removed receiver board may have provided them. Confirm connector polarity, LED series/parallel arrangement, voltage, current, and resistor location before connecting power or choosing the supply rail.
+
+GPIO4 also drives the ESP32-CAM's onboard white flash LED, which will turn on with the front lights. GPIO2 must not be pulled high at reset when entering the serial bootloader; the external gate pull-down keeps the proposed switch off and lets GPIO2 remain low. Test both normal boot and serial flashing with the finished lighting circuit attached. The lights default off at boot and turn off when an OTA upload begins. They are independent of the motor command timeout.
+
 ## Perfboard capacitor plan
 
 | Rail to common GND | Components | Placement intent |

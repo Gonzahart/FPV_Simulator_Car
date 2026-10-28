@@ -9,10 +9,10 @@ The goal is to turn a stock RC car into a first-person-view vehicle controlled f
 | Area | What is here now |
 | --- | --- |
 | Chassis | Stock Porsche-style car inspected; rear drive and front steering motors identified. |
-| Control firmware | ESP32-CAM Arduino sketch serves a local web controller with MJPEG camera video over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, a 700 ms command timeout, and a browser OTA update page. |
+| Control firmware | ESP32-CAM Arduino sketch serves a local web controller with MJPEG camera video over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, separate front/rear light controls, a 700 ms motor command timeout, and a browser OTA update page. |
 | Power architecture | Two independent 1S batteries: motor battery feeds the driver motor supply; camera battery feeds a TPS61023 5 V boost module. Negatives share a common ground. |
 | Wiring | Editable DIY Layout Creator (DIYLC) project includes the off-board devices and the converter/capacitor perfboard on one canvas. |
-| Still to validate | Final perfboard assembly, battery runtime, motor current and thermal behavior, ESP32-CAM supply stability during video, stream reliability, and driving video. |
+| Still to validate | Final perfboard assembly, LED harness current limiting and switch wiring, battery runtime, motor current and thermal behavior, ESP32-CAM supply stability during video, stream reliability, and driving video. |
 
 ## System at a glance
 
@@ -35,7 +35,7 @@ The ESP32-CAM's 3.3 V output provides the TB6612FNG's **logic supply and control
 
 The current sketch targets an **AI-Thinker ESP32-CAM** using **Arduino-ESP32 3.x**. Set a local OTA password and select an OTA-capable partition scheme before the first serial flash. The sketch creates a Wi-Fi access point; connect a phone or laptop and open the IP address printed to Serial (typically `192.168.4.1`). The control page shows a QVGA camera stream and lets you hold the on-screen buttons or use **W/A/S/D**; the drive slider adjusts rear motor PWM. Later builds can be uploaded through the authenticated `/update` page while the car is parked. See the [firmware instructions](firmware/esp32_cam_tb6612_motor_test/README.md).
 
-The camera is initialized for MJPEG video on port 81; the control and OTA pages remain on port 80 so video does not block motor requests. The microSD card is **not initialized**. GPIO12–15 are assigned to motor control, so microSD cannot be used with this pin map. GPIO12 is also an ESP32 boot strapping pin: if a connected driver prevents boot, isolate or revise that connection before considering the build complete. The [firmware notes](firmware/esp32_cam_tb6612_motor_test/README.md) describe the control behavior and known limits.
+The camera is initialized for MJPEG video on port 81; the control and OTA pages remain on port 80 so video does not block motor requests. The firmware also provides separate front and rear light buttons, but the LED pairs still need external switches and verified current limiting before they can be connected. The microSD card is **not initialized**. GPIO12–15 are assigned to motor control, so microSD cannot be used with this pin map. GPIO12 is also an ESP32 boot strapping pin: if a connected driver prevents boot, isolate or revise that connection before considering the build complete. The [firmware notes](firmware/esp32_cam_tb6612_motor_test/README.md) describe the control behavior and known limits.
 
 ## Engineering decisions
 
