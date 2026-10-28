@@ -26,11 +26,12 @@ constexpr uint8_t DRIVE_IN2 = 13;  // AIN2
 constexpr uint8_t STEER_IN1 = 14;  // BIN1
 constexpr uint8_t STEER_IN2 = 15;  // BIN2
 
-// Logic outputs for external LED switches, not power outputs for the LEDs.
-// GPIO4 also drives the ESP32-CAM's onboard flash LED; GPIO2 is a boot strap
-// pin and its external switch gate must be held low at reset.
-constexpr uint8_t FRONT_LIGHT_PIN = 4;
+// Use one 1 kΩ resistor per body-light harness. GPIO3 is UART RX: disconnect
+// the serial programmer's TX lead before running this sketch.
+// GPIO4 drives only the onboard flash LED; GPIO2 is a boot strap pin.
+constexpr uint8_t FRONT_LIGHT_PIN = 3;
 constexpr uint8_t REAR_LIGHT_PIN = 2;
+constexpr uint8_t FLASH_LIGHT_PIN = 4;
 
 // Camera XCLK uses LEDC channel 0 / timer 0; keep motors on channels 4-7.
 constexpr uint8_t DRIVE_CH1 = 4;
@@ -60,7 +61,10 @@ int requestedDrive = 0;  // -255 to +255
 int requestedSteer = 0;  // -1, 0, or +1
 int steeringHoldPwm = DEFAULT_STEER_HOLD_PWM;
 bool frontLightsOn = false;
+bool rearLightsManualOn = false;
 bool rearLightsOn = false;
+bool flashLightOn = false;
+bool brakeModeOn = false;
 int previousSteer = 0;
 uint32_t steerStartedAt = 0;
 uint32_t lastCommandAt = 0;
@@ -84,12 +88,16 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     body { margin: 0; background: #111; color: #eee; text-align: center; touch-action: none; }
     main { max-width: 640px; margin: auto; padding: 22px; }
     h1 { font-size: 1.45rem; margin: 0 0 18px; }
-    .video { width: 100%; aspect-ratio: 4 / 3; object-fit: contain;
+    .video-wrap { position: relative; }
+    .video { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: contain;
              background: #000; border-radius: 12px; }
     #cameraStatus { color: #9ad; min-height: 1.4em; margin: 8px 0 18px; }
     .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
-    .lights { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 20px 0; }
-    .lights button { min-height: 56px; font-size: 1rem; }
+    .lights { position: absolute; inset: auto 8px 8px; display: grid;
+              grid-template-columns: 1fr 1fr; gap: 8px; }
+    .lights button { min-height: 46px; padding: 6px; font-size: .88rem;
+                     background: rgba(20, 20, 20, .85); border: 1px solid #777; }
+    .lights button[aria-pressed="true"] { background: rgba(18, 100, 65, .94); }
     .group { display: grid; gap: 12px; align-content: center; }
     button { min-height: 92px; border: 0; border-radius: 18px; font-size: 1.2rem;
              font-weight: 700; background: #333; color: white; }
@@ -102,7 +110,15 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <body>
 <main>
   <h1>ESP32 Drift Car</h1>
-  <img id="camera" class="video" alt="Live view from the car camera">
+  <div class="video-wrap">
+    <img id="camera" class="video" alt="Live view from the car camera">
+    <div class="lights" aria-label="Light controls">
+      <button id="frontLights" type="button" aria-pressed="false">Front: Off</button>
+      <button id="rearLights" type="button" aria-pressed="false">Rear: Off</button>
+      <button id="brakeMode" type="button" aria-pressed="false">Brake mode: Off</button>
+      <button id="flashLight" type="button" aria-pressed="false">Flash: Off</button>
+    </div>
+  </div>
   <p id="cameraStatus">Connecting to camera…</p>
   <div class="speed">
     <label>Drive power: <span id="speedValue">180</span>/255</label>
@@ -122,10 +138,6 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
       <button data-axis="drive" data-value="1">FORWARD</button>
       <button data-axis="drive" data-value="-1">REVERSE</button>
     </div>
-  </div>
-  <div class="lights">
-    <button id="frontLights" type="button" aria-pressed="false">Front lights: Off</button>
-    <button id="rearLights" type="button" aria-pressed="false">Rear lights: Off</button>
   </div>
   <p id="lightStatus"></p>
   <p id="status">Connect to the car, then hold a button.</p>
@@ -147,38 +159,52 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   const cameraStatus = document.getElementById('cameraStatus');
   const frontLights = document.getElementById('frontLights');
   const rearLights = document.getElementById('rearLights');
+  const flashLight = document.getElementById('flashLight');
+  const brakeMode = document.getElementById('brakeMode');
   const lightStatus = document.getElementById('lightStatus');
-  let lights = { front: false, rear: false };
+  const lightButtons = [frontLights, rearLights, brakeMode, flashLight];
+  let lights = { front: false, rear: false, flash: false, brake: false, rearEffective: false };
   let lightsBusy = false;
 
   function renderLights() {
-    frontLights.textContent = `Front lights: ${lights.front ? 'On' : 'Off'}`;
-    rearLights.textContent = `Rear lights: ${lights.rear ? 'On' : 'Off'}`;
+    frontLights.textContent = `Front: ${lights.front ? 'On' : 'Off'}`;
+    rearLights.textContent = lights.rear ? 'Rear: On' :
+      (lights.rearEffective ? 'Rear: Auto' : 'Rear: Off');
+    flashLight.textContent = `Flash: ${lights.flash ? 'On' : 'Off'}`;
+    brakeMode.textContent = `Brake mode: ${lights.brake ? 'On' : 'Off'}`;
     frontLights.setAttribute('aria-pressed', String(lights.front));
     rearLights.setAttribute('aria-pressed', String(lights.rear));
+    flashLight.setAttribute('aria-pressed', String(lights.flash));
+    brakeMode.setAttribute('aria-pressed', String(lights.brake));
+    lightStatus.textContent = lights.rearEffective && !lights.rear
+      ? 'Rear lights on automatically while reversing.' : '';
   }
 
-  async function setLights(front, rear) {
+  async function setLights(changes) {
     if (lightsBusy) return;
     lightsBusy = true;
-    frontLights.disabled = rearLights.disabled = true;
+    lightButtons.forEach(button => button.disabled = true);
     try {
-      const response = await fetch(`/lights?front=${Number(front)}&rear=${Number(rear)}`,
+      const next = { ...lights, ...changes };
+      const query = `front=${Number(next.front)}&rear=${Number(next.rear)}` +
+                    `&flash=${Number(next.flash)}&brake=${Number(next.brake)}`;
+      const response = await fetch(`/lights?${query}`,
                                    { cache: 'no-store' });
       if (!response.ok) throw new Error('Light command failed');
       lights = await response.json();
       renderLights();
-      lightStatus.textContent = '';
     } catch (_) {
       lightStatus.textContent = 'Could not change lights. Check the connection.';
     } finally {
       lightsBusy = false;
-      frontLights.disabled = rearLights.disabled = false;
+      lightButtons.forEach(button => button.disabled = false);
     }
   }
 
-  frontLights.addEventListener('click', () => setLights(!lights.front, lights.rear));
-  rearLights.addEventListener('click', () => setLights(lights.front, !lights.rear));
+  frontLights.addEventListener('click', () => setLights({ front: !lights.front }));
+  rearLights.addEventListener('click', () => setLights({ rear: !lights.rear }));
+  flashLight.addEventListener('click', () => setLights({ flash: !lights.flash }));
+  brakeMode.addEventListener('click', () => setLights({ brake: !lights.brake }));
   fetch('/lights', { cache: 'no-store' })
     .then(response => { if (!response.ok) throw new Error('Light status failed'); return response.json(); })
     .then(state => { lights = state; renderLights(); })
@@ -207,15 +233,18 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
     const drive = driveDirection * drivePower;
     fetch(`/control?drive=${drive}&steer=${steerDirection}&hold=${steerHoldPower}`,
           { cache: 'no-store' })
-      .then(r => {
+      .then(async r => {
         if (!r.ok) throw new Error('request failed');
+        const state = await r.json();
+        lights.rearEffective = state.rearEffective;
+        renderLights();
         status.textContent = `Drive ${drive}, steer ${steerDirection}`;
       })
       .catch(() => status.textContent = 'Control connection lost — motors will stop')
       .finally(() => requestPending = false);
   }
 
-  document.querySelectorAll('button').forEach(button => {
+  document.querySelectorAll('button[data-axis]').forEach(button => {
     const axis = button.dataset.axis;
     const value = Number(button.dataset.value);
 
@@ -388,19 +417,38 @@ void writeBridge(uint8_t in1, uint8_t in2, int command, bool reversed) {
   }
 }
 
+void updateRearLight() {
+  rearLightsOn = rearLightsManualOn || (brakeModeOn && requestedDrive < 0);
+  digitalWrite(REAR_LIGHT_PIN, rearLightsOn ? HIGH : LOW);
+}
+
 void stopAllMotors() {
   requestedDrive = 0;
   requestedSteer = 0;
   previousSteer = 0;
   writeBridge(DRIVE_IN1, DRIVE_IN2, 0, DRIVE_REVERSED);
   writeBridge(STEER_IN1, STEER_IN2, 0, STEERING_REVERSED);
+  updateRearLight();
 }
 
-void setLights(bool front, bool rear) {
+void setLights(bool front, bool rear, bool flash, bool brake) {
   frontLightsOn = front;
-  rearLightsOn = rear;
+  rearLightsManualOn = rear;
+  flashLightOn = flash;
+  brakeModeOn = brake;
   digitalWrite(FRONT_LIGHT_PIN, front ? HIGH : LOW);
-  digitalWrite(REAR_LIGHT_PIN, rear ? HIGH : LOW);
+  digitalWrite(FLASH_LIGHT_PIN, flash ? HIGH : LOW);
+  updateRearLight();
+}
+
+void sendLightState() {
+  server.sendHeader("Cache-Control", "no-store");
+  const String state = String("{\"front\":") + (frontLightsOn ? "true" : "false") +
+                       ",\"rear\":" + (rearLightsManualOn ? "true" : "false") +
+                       ",\"flash\":" + (flashLightOn ? "true" : "false") +
+                       ",\"brake\":" + (brakeModeOn ? "true" : "false") +
+                       ",\"rearEffective\":" + (rearLightsOn ? "true" : "false") + "}";
+  server.send(200, "application/json", state);
 }
 
 void applyMotorCommands() {
@@ -441,35 +489,39 @@ void handleControl() {
   }
   lastCommandAt = millis();
   applyMotorCommands();
-  server.send(200, "text/plain", "OK");
+  updateRearLight();
+  sendLightState();
 }
 
 void handleLights() {
   const bool hasFront = server.hasArg("front");
   const bool hasRear = server.hasArg("rear");
-  if (hasFront != hasRear) {
-    server.send(400, "text/plain", "Specify both front and rear light states");
+  const bool hasFlash = server.hasArg("flash");
+  const bool hasBrake = server.hasArg("brake");
+  const bool hasAny = hasFront || hasRear || hasFlash || hasBrake;
+  if (hasAny && !(hasFront && hasRear && hasFlash && hasBrake)) {
+    server.send(400, "text/plain", "Specify front, rear, flash, and brake states");
     return;
   }
 
-  if (hasFront) {
+  if (hasAny) {
     if (otaInProgress || rebootPending) {
       server.send(503, "text/plain", "Firmware update in progress; lights are off");
       return;
     }
     const String front = server.arg("front");
     const String rear = server.arg("rear");
-    if ((front != "0" && front != "1") || (rear != "0" && rear != "1")) {
+    const String flash = server.arg("flash");
+    const String brake = server.arg("brake");
+    if ((front != "0" && front != "1") || (rear != "0" && rear != "1") ||
+        (flash != "0" && flash != "1") || (brake != "0" && brake != "1")) {
       server.send(400, "text/plain", "Light states must be 0 or 1");
       return;
     }
-    setLights(front == "1", rear == "1");
+    setLights(front == "1", rear == "1", flash == "1", brake == "1");
   }
 
-  server.sendHeader("Cache-Control", "no-store");
-  const String state = String("{\"front\":") + (frontLightsOn ? "true" : "false") +
-                       ",\"rear\":" + (rearLightsOn ? "true" : "false") + "}";
-  server.send(200, "application/json", state);
+  sendLightState();
 }
 
 // The update page is reachable through the car's existing Wi-Fi access point.
@@ -515,7 +567,7 @@ void handleUpdateUpload() {
       otaFailed = false;
       otaComplete = false;
       stopAllMotors();
-      setLights(false, false);
+      setLights(false, false, false, false);
       otaStarted = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
       if (!otaStarted) {
         otaFailed = true;
@@ -571,12 +623,14 @@ void setup() {
   Serial.begin(115200);
   delay(300);
 
-  // Both external LED switches default off. External gate pull-downs keep
-  // them off before firmware reaches setup(), including during boot/flash.
+  // Body lights and onboard flash default off. GPIO2's LED/resistor path to
+  // ground does not pull this boot strap pin high during serial flashing.
   digitalWrite(FRONT_LIGHT_PIN, LOW);
   digitalWrite(REAR_LIGHT_PIN, LOW);
+  digitalWrite(FLASH_LIGHT_PIN, LOW);
   pinMode(FRONT_LIGHT_PIN, OUTPUT);
   pinMode(REAR_LIGHT_PIN, OUTPUT);
+  pinMode(FLASH_LIGHT_PIN, OUTPUT);
 
   bool pwmOk = true;
   pwmOk &= ledcAttachChannel(DRIVE_IN1, MOTOR_PWM_HZ, MOTOR_PWM_BITS, DRIVE_CH1);
