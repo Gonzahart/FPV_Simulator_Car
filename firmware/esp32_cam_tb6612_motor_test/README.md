@@ -8,7 +8,7 @@
 2. Open the `.ino` in Arduino IDE with Arduino-ESP32 3.x installed and select the AI-Thinker ESP32-CAM board. In **Tools → Partition Scheme**, choose an option that supports OTA (two app slots); verify the compiled firmware fits one slot. Do not choose a no-OTA or huge-app layout.
 3. Flash this first OTA-capable build using the board's serial-programming procedure. Disconnect programming power before connecting the intended battery supply.
 4. With the verified 5 V and common ground connections in place, open Serial at 115200 baud to read the access point and IP address. Join that Wi-Fi network and visit the printed address.
-5. The page displays the live camera view above the controls. The stream is also available at `http://192.168.4.1:81/stream` (substitute the printed AP IP if different). Hold a touch button or use W/A/S/D. The drive-power slider selects 80–255 out of 255. The steering-hold slider starts at 210/255 and adjusts the power used after the initial steering kick. The front and rear light buttons control separate GPIO outputs once external LED switches are wired. Release commands zero. The UI sends a state heartbeat while connected.
+5. The page displays the live camera view with front, rear, brake-mode, and onboard-flash controls overlaid. The stream is also available at `http://192.168.4.1:81/stream` (substitute the printed AP IP if different). Hold a touch button or use W/A/S/D. The drive-power slider selects 80–255 out of 255. The steering-hold slider starts at 210/255 and adjusts the power used after the initial steering kick. The front and rear buttons set their manual light states independently. When brake mode is on, holding S or the REVERSE button also lights the rear pair until release or command timeout; the manual rear setting still takes precedence if it is on. The flash button controls only the onboard LED. Release commands zero. The UI sends a state heartbeat while connected.
 6. If camera initialization fails, Serial prints an error; motor control and OTA remain available. Test motor response and the 700 ms timeout **while video is open**, then measure the ESP32-CAM 5 V rail for dips during streaming and motor starts.
 
 ## Later firmware updates over Wi-Fi
@@ -26,7 +26,8 @@ The upload page uses HTTP Basic authentication and checks that a browser POST or
 | --- | --- |
 | Rear motor | PWM on GPIO12/13, up to 18 kHz, 8-bit duty |
 | Steering motor | PWM on GPIO14/15, 120 ms full-power kick followed by adjustable hold duty (default 210/255, range 150–255) |
-| Body lights | GPIO4 for front, GPIO2 for rear; separate on/off buttons and `/lights` state endpoint; both default off |
+| Body lights | GPIO3 for front, GPIO2 for rear; separate manual buttons; optional automatic rear light on reverse; both default off |
+| Onboard flash | GPIO4; independent button, default off |
 | Lost commands | Both motor commands set to zero after 700 ms without a request |
 | Camera | AI-Thinker pin map; JPEG QVGA (320 × 240), MJPEG at port 81 `/stream`; two frame buffers with PSRAM, one without |
 | LEDC allocation | Channel 0 / timer 0 for camera XCLK; channels 4–7 for motors |
@@ -37,9 +38,9 @@ The camera runs on a separate HTTP server so its long-lived video response does 
 
 ## Body-light outputs
 
-The front and rear JST connectors each carry a pair of LEDs that was powered through the original receiver board. The GPIOs are **control signals only**. Each pair needs a suitable external transistor/MOSFET switch and confirmed current limiting; do not connect an LED pair directly to GPIO2 or GPIO4, or assume the removed receiver board's resistors are still in circuit. The [hardware notes](../../docs/hardware.md) describe the proposed switching arrangement and checks needed before connecting the LED harnesses.
+The front and rear JST connectors each carry a pair of LEDs that was powered through the original receiver board. With the measured low-current harnesses, connect GPIO3 through a 1 kΩ resistor to the front red lead and its white lead to GND. Connect GPIO2 through a separate 1 kΩ resistor to the rear red lead and its yellow lead to GND. Do not connect either harness to a battery, 3.3 V rail, or GPIO without its resistor. The [hardware notes](../../docs/hardware.md) record the measured voltages and currents.
 
-GPIO4 also drives the ESP32-CAM's onboard white flash LED, so it will light along with the front pair. GPIO2 affects serial bootloader entry if an external circuit pulls it high at reset; the switch gate needs a pull-down and the finished wiring needs a boot/flash test. Both outputs start low and are turned off when an OTA upload starts. Light state is independent of the 700 ms motor-command timeout.
+GPIO4 drives only the ESP32-CAM's onboard white flash LED, independently of the front pair. GPIO3 is UART RX; do not leave a serial programmer's TX lead connected while running this firmware. GPIO2 affects serial bootloader entry if an external circuit pulls it high at reset; the proposed LED/resistor path does not. Test boot and any future serial recovery flash with the new wiring. All lights start off and are turned off when an OTA upload starts. Automatic rear lighting in brake mode follows the reverse motor command and the 700 ms timeout; manual light settings persist across a motor timeout.
 
 ## Steering hold adjustment
 
