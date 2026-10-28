@@ -4,15 +4,15 @@
 
 <img src="assets/chassis.jpeg" alt="Black Porsche-style RC car used as the project chassis" width="620">
 
-The goal is to turn a stock RC car into a first-person-view vehicle controlled from a browser. The current repository captures the chassis teardown, ESP32 motor-control firmware, and a two-battery wiring design. **FPV video and a simulator integration are goals, not completed features.**
+The goal is to turn a stock RC car into a first-person-view vehicle controlled from a browser. The repository captures the chassis teardown, motor-control firmware with a camera-streaming prototype, and a two-battery wiring design. **Camera streaming has been added to the firmware but has not yet been validated on the assembled car; simulator integration remains a goal.**
 
 | Area | What is here now |
 | --- | --- |
 | Chassis | Stock Porsche-style car inspected; rear drive and front steering motors identified. |
-| Control firmware | ESP32-CAM Arduino sketch serves a local web controller over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, a 700 ms command timeout, and a browser OTA update page. |
+| Control firmware | ESP32-CAM Arduino sketch serves a local web controller with MJPEG camera video over its Wi-Fi access point. It includes variable drive PWM, steering kick/hold behavior, independent body lights and onboard flash, automatic rear lights on reverse when brake mode is enabled, a 700 ms motor command timeout, and a browser OTA update page. |
 | Power architecture | Two independent 1S batteries: motor battery feeds the driver motor supply; camera battery feeds a TPS61023 5 V boost module. Negatives share a common ground. |
 | Wiring | Editable DIY Layout Creator (DIYLC) project includes the off-board devices and the converter/capacitor perfboard on one canvas. |
-| Still to validate | Final perfboard assembly, battery runtime, motor current and thermal behavior, ESP32-CAM supply stability, camera streaming, and driving video. |
+| Still to validate | Final perfboard assembly, LED harness current limiting and switch wiring, battery runtime, motor current and thermal behavior, ESP32-CAM supply stability during video, stream reliability, and driving video. |
 
 ## System at a glance
 
@@ -24,7 +24,7 @@ The ESP32-CAM's 3.3 V output provides the TB6612FNG's **logic supply and control
 
 | Path | Purpose |
 | --- | --- |
-| [`firmware/esp32_cam_tb6612_motor_test/`](firmware/esp32_cam_tb6612_motor_test/) | Current motor-control test sketch and flashing notes. No camera stream in this sketch. |
+| [`firmware/esp32_cam_tb6612_motor_test/`](firmware/esp32_cam_tb6612_motor_test/) | Current motor-control, camera-streaming, and OTA sketch with flashing notes. |
 | [`hardware/RC_car_complete_system.diy`](hardware/RC_car_complete_system.diy) | Editable whole-system DIYLC layout, including the converter perfboard. |
 | [`docs/hardware.md`](docs/hardware.md) | Power, signals, capacitors, and schematic limitations. |
 | [`docs/bring-up.md`](docs/bring-up.md) | Incremental power-on and measurement checklist. |
@@ -33,9 +33,9 @@ The ESP32-CAM's 3.3 V output provides the TB6612FNG's **logic supply and control
 
 ## Control firmware
 
-The current sketch targets an **AI-Thinker ESP32-CAM** using **Arduino-ESP32 3.x**. Set a local OTA password and select an OTA-capable partition scheme before the first serial flash. The sketch creates a Wi-Fi access point; connect a phone or laptop and open the IP address printed to Serial (typically `192.168.4.1`). Hold the on-screen buttons or use **W/A/S/D**; the drive slider adjusts rear motor PWM. Later builds can be uploaded through the authenticated `/update` page while the car is parked. See the [firmware instructions](firmware/esp32_cam_tb6612_motor_test/README.md).
+The current sketch targets an **AI-Thinker ESP32-CAM** using **Arduino-ESP32 3.x**. Set a local OTA password and select an OTA-capable partition scheme before the first serial flash. The sketch creates a Wi-Fi access point; connect a phone or laptop and open the IP address printed to Serial (typically `192.168.4.1`). The control page shows a QVGA camera stream and lets you hold the on-screen buttons or use **W/A/S/D**; the drive slider adjusts rear motor PWM. Later builds can be uploaded through the authenticated `/update` page while the car is parked. See the [firmware instructions](firmware/esp32_cam_tb6612_motor_test/README.md).
 
-The camera and microSD card are **not initialized**. GPIO12–15 are assigned to motor control, so microSD cannot be used with this pin map. GPIO12 is also an ESP32 boot strapping pin: if a connected driver prevents boot, isolate or revise that connection before considering the build complete. The [firmware notes](firmware/esp32_cam_tb6612_motor_test/README.md) describe the control behavior and known limits.
+The camera is initialized for MJPEG video on port 81; the control and OTA pages remain on port 80 so video does not block motor requests. Front, rear, brake-mode, and onboard-flash buttons are overlaid on the video. The measured body-light harnesses use separate 1 kΩ resistors on GPIO3 and GPIO2; GPIO4 remains dedicated to the onboard flash. The microSD card is **not initialized**. GPIO12–15 are assigned to motor control, so microSD cannot be used with this pin map. GPIO12 is also an ESP32 boot strapping pin: if a connected driver prevents boot, isolate or revise that connection before considering the build complete. The [firmware notes](firmware/esp32_cam_tb6612_motor_test/README.md) describe the control behavior and known limits.
 
 ## Engineering decisions
 
@@ -49,7 +49,7 @@ The camera and microSD card are **not initialized**. GPIO12–15 are assigned to
 1. Match the actual TPS61023 module pads and perfboard dimensions to the DIYLC layout; assemble and inspect the power board.
 2. Measure 5 V at the ESP32-CAM during Wi-Fi activity and motor starts; record battery voltage and peak motor current.
 3. Demonstrate controlled forward/reverse and steering under load; log timeout and power-cycle behavior.
-4. Add camera streaming without colliding with the motor PWM channels, then capture a short driving demo with measured results.
+4. Validate camera streaming alongside motor control and OTA on the assembled car, then capture a short driving demo with measured results.
 
 The original chassis and electronics are shown below. The stock receiver board was inspected as part of planning; the replacement architecture is documented in the DIYLC file.
 
